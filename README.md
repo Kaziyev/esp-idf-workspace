@@ -14,8 +14,8 @@ The project reads accelerometer data from the BMI270 and outputs the X, Y, and Z
 
 | Signal | ESP32-S3 |
 |---|---|
-| SDA | GPIO 39 |
-| SCL | GPIO 40 |
+| SDA | GPIO 40 |
+| SCL | GPIO 39 |
 
 Detected BMI270 I2C address:
 
