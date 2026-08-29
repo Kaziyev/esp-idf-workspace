@@ -1,3 +1,7 @@
-**/build/
-sdkconfig.old
-*.log
+*
+!.gitignore
+!apps/
+apps/*
+!apps/i2c_imu/
+!apps/i2c_imu/**
+apps/i2c_imu/build/
