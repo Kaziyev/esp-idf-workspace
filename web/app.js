@@ -13,6 +13,49 @@ const determinant=R=>dot(R[0],cross(R[1],R[2]));
 const rawUnits={acc:'g',gyro:'dps',mag:'uT'};
 const qmul=([w,x,y,z],[a,b,c,d])=>[w*a-x*b-y*c-z*d,w*b+x*a+y*d-z*c,w*c-x*d+y*a+z*b,w*d+x*c-y*b+z*a];
 function qstep(q,v){const angle=norm(v);if(angle<1e-12)return q.slice();const k=Math.sin(angle/2)/angle;return unit(qmul(q,[Math.cos(angle/2),...v.map(x=>x*k)]))}
+const qconj=([w,x,y,z])=>[w,-x,-y,-z];
+function matrixQuat(R){
+ const trace=R[0][0]+R[1][1]+R[2][2];
+ if(trace>0){const s=2*Math.sqrt(1+trace);return unit([s/4,(R[2][1]-R[1][2])/s,(R[0][2]-R[2][0])/s,(R[1][0]-R[0][1])/s])}
+ const i=[0,1,2].reduce((a,b)=>R[a][a]>R[b][b]?a:b),j=(i+1)%3,k=(i+2)%3,s=2*Math.sqrt(1+R[i][i]-R[j][j]-R[k][k]),q=[0,0,0,0];
+ q[0]=(R[k][j]-R[j][k])/s;q[i+1]=s/4;q[j+1]=(R[i][j]+R[j][i])/s;q[k+1]=(R[i][k]+R[k][i])/s;return unit(q);
+}
+// S = native BMI270 axes, B = calibrated forward/left/up axes, W = filter world.
+// v_B = R_BS v_S; q_WB = q_WS * inverse(q_BS). Heading only rotates W about Z.
+class IMUFrame{
+ constructor(){this.sensorToBody=[1,0,0,0];this.calibrated=false;this.resetHeading()}
+ resetHeading(){this.heading=0;this.zeroOnNext=this.calibrated}
+ setMount(q){if(!vec(q,4)||Math.abs(norm(q)-1)>.001)throw new Error('Некорректная калибровка IMU');this.sensorToBody=unit(q);this.calibrated=true;this.resetHeading()}
+ static fromPoses(level,forward){
+  if(!vec(level,3)||!vec(forward,3)||norm(level)<.9||norm(level)>1.1||norm(forward)<.9||norm(forward)>1.1)throw new Error('Для калибровки нужен неподвижный ACC около 1 g.');
+  const z=unit(level),a=unit(forward),c=clamp(dot(a,z),-1,1),angle=Math.acos(c)/RAD;
+  if(angle<15||angle>60)throw new Error('Наклоните переднюю сторону вниз на 15–60° от горизонтального положения.');
+  // At positive pitch (nose down), gravity in body axes is [-sin(p), 0, cos(p)].
+  const x=unit(z.map((v,i)=>c*v-a[i])),y=unit(cross(z,x));
+  return matrixQuat([x,y,z]);
+ }
+ reference(q){
+  if(!vec(q,4))return false;
+  const body=unit(qmul(q,qconj(this.sensorToBody))),front=mv(rotation(body),[1,0,0]);
+  if(Math.hypot(front[0],front[1])<.1)return false;
+  this.heading=Math.atan2(front[1],front[0])/RAD;this.zeroOnNext=false;return true;
+ }
+ apply(p){
+  // Keep the filter/input frame intact, including when history is recalculated.
+  if(!p.sensor)p.sensor={q:p.q?.slice()??null,...Object.fromEntries(['a','g','m','b'].map(k=>[k,p[k].slice()]))};
+  const s=p.sensor,demo=p.mode==='demo',mount=demo?[1,0,0,0]:this.sensorToBody,R=rotation(mount);
+  if(!demo&&this.zeroOnNext)this.reference(s.q);
+  for(const k of ['a','g','m','b'])p[k]=vec(s[k],3)?mv(R,s[k]):s[k].slice();
+  p.q=s.q?unit(qmul(quatEuler([0,0,demo?0:-this.heading]),qmul(s.q,qconj(mount)))):null;
+  p.rpy=p.q?eulerQuat(p.q):[null,null,null];p.coordinateFrame=demo?'demo':this.calibrated?'body_calibrated':'imu_native';
+  p.mountQ=mount.slice();p.headingZero=demo?0:this.heading;
+ }
+}
+const imuFrame=new IMUFrame(),mountStorageKey='qav250.imu-mount.v1';
+let mountSaved=false,levelPose=null;
+try{const saved=JSON.parse(localStorage.getItem(mountStorageKey));if(saved?.version===1){imuFrame.setMount(saved.sensorToBody);mountSaved=true}}catch{}
+function saveMount(){try{if(imuFrame.calibrated)localStorage.setItem(mountStorageKey,JSON.stringify({version:1,sensorToBody:imuFrame.sensorToBody}));else localStorage.removeItem(mountStorageKey);mountSaved=imuFrame.calibrated}catch{mountSaved=false}}
+function resetCoordinateSession(){imuFrame.resetHeading();levelPose=null}
 // Browser-only complementary AHRS. This is not the firmware's MEKF.
 // Body -> world, right-handed XYZ, stationary specific force points up.
 class BrowserAHRS{
@@ -97,17 +140,18 @@ class TelemetryParser{
 const state={bytes:0,lines:0,lastByte:null,connectedAt:null,lastError:'',renderError:'',portLabel:'',signalNote:'',mode:'demo',paused:false,history:[],latest:null,display:null,freezeTime:0,freezeHistory:[],count:0,errors:0,gaps:0,lastSeq:null,lastRx:null,arrivals:[],chartMode:'sensors',window:10,port:null,reader:null,reading:false,connecting:false,raw:[],start:performance.now(),lastDemo:0,clockBase:null,sourceTime:null};
 function setMessage(s){$('message-text').textContent=s;$('message').classList.toggle('visible',!!s)}
 $('dismiss').onclick=()=>setMessage('');
-function setMode(mode){browserAHRS.reset();state.mode=mode;$('raw-panel').classList.add('hidden');state.bytes=0;state.lines=0;state.lastByte=null;state.lastError='';state.renderError='';$('serial-panel').classList.toggle('hidden',mode!=='serial');state.history=[];state.latest=null;state.display=null;state.count=0;state.errors=0;state.gaps=0;state.lastSeq=null;state.lastRx=null;state.arrivals=[];state.clockBase=null;state.sourceTime=null;state.paused=false;state.freezeHistory=[];state.raw=[];state.start=performance.now();state.lastDemo=0;state.freezeTime=0;
+function setMode(mode){browserAHRS.reset();resetCoordinateSession();state.mode=mode;$('raw-panel').classList.add('hidden');state.bytes=0;state.lines=0;state.lastByte=null;state.lastError='';state.renderError='';$('serial-panel').classList.toggle('hidden',mode!=='serial');state.history=[];state.latest=null;state.display=null;state.count=0;state.errors=0;state.gaps=0;state.lastSeq=null;state.lastRx=null;state.arrivals=[];state.clockBase=null;state.sourceTime=null;state.paused=false;state.freezeHistory=[];state.raw=[];state.start=performance.now();state.lastDemo=0;state.freezeTime=0;
  [...$('matrix').children].forEach((el,i)=>el.textContent=i%4===0?'1.000':'0.000');$('det').textContent='det(R) = —';$('ortho').textContent='‖RᵀR − I‖ = —';$('needle').style.transform='rotate(0deg)';
  $('raw-log').textContent=mode==='demo'?'Демонстрация: синтетический поток.':'Ожидание данных…';$('demo').classList.toggle('active',mode==='demo');$('demo').setAttribute('aria-pressed',String(mode==='demo'));$('pause').textContent='Ⅱ Пауза';$('pause').setAttribute('aria-pressed','false');$('paused-label').classList.add('hidden');
  $('source-badge').textContent=mode==='demo'?'● ДЕМО':mode==='serial'?'● USB SERIAL':'● ЖУРНАЛ';$('source-badge').className='chip '+(mode==='demo'?'warning':'off');
  $('scene-source').textContent=mode==='demo'?'Синтетическое движение':mode==='serial'?'Ожидание ESP32':'Данные журнала';$('motor-note').textContent=mode==='demo'?'Вращение винтов — иллюстрация':'RPM отсутствует · винты не анимируются';
  $('rx-note').textContent=mode==='demo'?'Частота демопакетов':mode==='serial'?'Частота принятых пакетов':'Частота по времени журнала';
 }
-function receive(p,options={}){const now=options.hostNow??performance.now();if(p.seq!==null&&state.lastSeq!==null){if(p.seq>state.lastSeq+1)state.gaps+=p.seq-state.lastSeq-1;else if(p.seq<=state.lastSeq){state.history=[];state.arrivals=[];state.clockBase=null;state.sourceTime=null;browserAHRS.reset()}}if(p.seq!==null)state.lastSeq=p.seq;
- if(p.tUs!==null){if(state.sourceTime!==null&&p.tUs<=state.sourceTime){state.history=[];state.clockBase=null;browserAHRS.reset()}state.sourceTime=p.tUs;if(state.clockBase===null)state.clockBase=p.tUs;p.t=(p.tUs-state.clockBase)/1e6}else p.t=options.logTime??(now-state.start)/1000;
+function receive(p,options={}){const now=options.hostNow??performance.now();if(p.seq!==null&&state.lastSeq!==null){if(p.seq>state.lastSeq+1)state.gaps+=p.seq-state.lastSeq-1;else if(p.seq<=state.lastSeq){state.history=[];state.arrivals=[];state.clockBase=null;state.sourceTime=null;browserAHRS.reset();resetCoordinateSession()}}if(p.seq!==null)state.lastSeq=p.seq;
+ if(p.tUs!==null){if(state.sourceTime!==null&&p.tUs<=state.sourceTime){state.history=[];state.clockBase=null;browserAHRS.reset();resetCoordinateSession()}state.sourceTime=p.tUs;if(state.clockBase===null)state.clockBase=p.tUs;p.t=(p.tUs-state.clockBase)/1e6}else p.t=options.logTime??(now-state.start)/1000;
+ if(state.latest&&state.latest.estimated!==p.estimated){browserAHRS.reset();resetCoordinateSession();state.history=[];state.freezeHistory=[]}
  p.timeBasis=p.tUs!==null?'device':state.mode==='log'?'log-assumed':'usb-arrival';if(p.estimated)browserAHRS.update(p);else browserAHRS.reset();
- p.rx=now;p.mode=state.mode;state.latest=p;state.lastRx=now;state.count++;state.history.push(p);while(state.history.length>0&&(p.t-state.history[0].t>60||state.history.length>15000))state.history.shift();state.arrivals.push(now);while(state.arrivals.length&&now-state.arrivals[0]>2500)state.arrivals.shift();if(!state.paused)state.display=p;
+ p.rx=now;p.mode=state.mode;imuFrame.apply(p);state.latest=p;state.lastRx=now;state.count++;state.history.push(p);while(state.history.length>0&&(p.t-state.history[0].t>60||state.history.length>15000))state.history.shift();state.arrivals.push(now);while(state.arrivals.length&&now-state.arrivals[0]>2500)state.arrivals.shift();if(!state.paused)state.display=p;
 }
 function parserForLive(){return new TelemetryParser(p=>receive(p),reason=>{state.errors++;state.lastError=reason||'Ошибка формата'},s=>{state.lines++;state.raw.push(s);if(state.raw.length>120)state.raw.shift()})}
 let liveParser=parserForLive();
@@ -151,19 +195,60 @@ function togglePause(){state.paused=!state.paused;if(state.paused){state.freezeT
 $('pause').onclick=togglePause;
 function resetBrowserView(){
  const log=state.mode==='log'?state.history.map(p=>({input:p.input,t:p.t})):null;
- browserAHRS.reset();state.history=[];state.freezeHistory=[];state.latest=null;state.display=null;state.clockBase=null;state.sourceTime=null;state.lastSeq=null;
+ browserAHRS.reset();resetCoordinateSession();state.history=[];state.freezeHistory=[];state.latest=null;state.display=null;state.clockBase=null;state.sourceTime=null;state.lastSeq=null;
  if(state.paused)togglePause();
  if(log){state.count=0;log.forEach((entry,i)=>{const p=normalizePacket(entry.input);if(p)receive(p,{hostNow:i*100,logTime:entry.t})});state.lastRx=null;state.arrivals=[]}
 }
 for(const [id,key] of [['raw-acc','acc'],['raw-gyro','gyro'],['raw-mag','mag']])$(id).onchange=e=>{rawUnits[key]=e.target.value;resetBrowserView()};
-$('zero-heading').onclick=resetBrowserView;
+$('zero-heading').onclick=zeroHeading;
+function captureStablePose(now=performance.now()){
+ if(state.mode!=='serial'||!state.port||state.paused)throw new Error('Подключите IMU по USB и включите отображение без паузы.');
+ if(!state.latest||now-state.latest.rx>1500)throw new Error('Нет свежих данных IMU.');
+ const samples=state.history.filter(p=>p.rx>=now-1100);
+ if(samples.length<8||samples.at(-1).rx-samples[0].rx<700)throw new Error('Удерживайте плату неподвижно не менее 1 секунды, затем повторите.');
+ if(samples.some(p=>!vec(p.sensor.a,3)||norm(p.sensor.a)<.9||norm(p.sensor.a)>1.1))throw new Error('ACC должен быть около 1 g. Проверьте единицы и удерживайте плату неподвижно.');
+ const mean=[0,1,2].map(i=>samples.reduce((sum,p)=>sum+p.sensor.a[i],0)/samples.length),axis=unit(mean);
+ if(samples.some(p=>dot(unit(p.sensor.a),axis)<Math.cos(2*RAD)||Math.abs(norm(p.sensor.a)-norm(mean))>.04||vec(p.sensor.g,3)&&norm(p.sensor.g.map((v,i)=>v-(vec(p.sensor.b,3)?p.sensor.b[i]:0)))>5))throw new Error('Плата движется. Удерживайте выбранное положение неподвижно 1 секунду.');
+ return {a:mean,q:state.latest.sensor.q?.slice()??null,rx:state.latest.rx,firstRx:samples[0].rx};
+}
+function reframeHistory(){
+ for(const p of new Set([...state.history,...state.freezeHistory,state.latest,state.display].filter(Boolean)))imuFrame.apply(p);
+ updateUI(performance.now());drawCharts();drawScene(performance.now());
+}
+function zeroHeading(){
+ const p=state.display;
+ if(state.mode==='demo'||!p?.sensor.q){setMessage('Для обнуления курса нужна ориентация подключённого IMU или журнала.');return}
+ if(!imuFrame.reference(p.sensor.q)){setMessage('Для обнуления курса опустите плату ближе к горизонтали.');return}
+ reframeHistory();setMessage('Курс обнулён. Калибровка монтажа и наклоны сохранены.');
+}
+$('calibrate-level').onclick=()=>{try{levelPose=captureStablePose();setMessage('Горизонтальное положение принято. Наклоните переднюю сторону платы вниз на 15–60°, без бокового крена, удерживайте 1 секунду и нажмите «2. Передняя сторона вниз».')}catch(e){setMessage(e.message)}updateCoordinateUI(performance.now())};
+$('calibrate-forward').onclick=()=>{try{
+ if(!levelPose)throw new Error('Сначала сохраните горизонтальное положение: шаг 1.');
+ const forward=captureStablePose();
+ if(forward.firstRx<=levelPose.rx)throw new Error('Удерживайте наклон вперёд 1 секунду после шага 1.');
+ imuFrame.setMount(IMUFrame.fromPoses(levelPose.a,forward.a));imuFrame.reference(levelPose.q);levelPose=null;saveMount();reframeHistory();
+ setMessage('Оси и перекос IMU откалиброваны: вперёд/назад → Pitch, вбок → Roll. '+(mountSaved?'Настройка сохранена в этом браузере.':'Настройка действует до закрытия страницы: браузер не разрешил сохранение.'));
+ }catch(e){setMessage(e.message)}updateCoordinateUI(performance.now())};
+$('calibrate-reset').onclick=()=>{imuFrame.sensorToBody=[1,0,0,0];imuFrame.calibrated=false;resetCoordinateSession();saveMount();reframeHistory();setMessage('Восстановлены собственные оси IMU. Для другого монтажа выполните шаги 1 и 2.');};
+function updateCoordinateUI(now){
+ const demo=state.mode==='demo',active=!demo&&imuFrame.calibrated,live=state.mode==='serial'&&!!state.port&&!state.paused&&state.latest&&now-state.latest.rx<=1500;
+ $('calibrate-level').disabled=!live;$('calibrate-forward').disabled=!live||!levelPose;$('calibrate-reset').disabled=!imuFrame.calibrated&&!levelPose;
+ $('zero-heading').disabled=demo||!state.display?.q;
+ $('frame-status').textContent=demo?'Демо · оси модели':active?'IMU → корпус · калибровка активна':'Собственные оси IMU · монтаж не откалиброван';
+ $('frame-note').textContent=levelPose?'Шаг 1 готов. Наклоните переднюю сторону вниз на 15–60°, удерживайте 1 секунду и нажмите шаг 2.':active?'Монтаж учтён для модели, углов, ACC/GYRO/MAG, bias, графиков и CSV. '+(mountSaved?'Сохранено в этом браузере. ':'Сохранение недоступно; действует до закрытия страницы. ')+'При смене платы повторите калибровку.':demo?'Подключите IMU, чтобы определить его монтаж. Демо использует собственные оси модели.':'До калибровки X/Y/Z совпадают с маркировкой IMU. Два положения определят направление вперёд и компенсируют перекос датчика.';
+ const labels=active||demo?['X · вперёд','Y · влево','Z · вверх']:['X · IMU','Y · IMU','Z · IMU'];
+ labels.forEach((label,i)=>$('axis-label-'+i).textContent=label);$('packet-frame').textContent=active||demo?'BODY':'IMU';
+ $('matrix-equation').textContent='v_world = R · v_'+(active||demo?'body':'IMU');
+ $('scene-frame').textContent=active||demo?'3D · корпус → мир':'3D · IMU → мир';
+ $('matrix-frame-note').textContent=active?'Векторы датчиков и R используют одну откалиброванную систему корпуса.':demo?'Синтетические векторы и ориентация в осях модели.':'Векторы и ориентация в собственных осях IMU.';
+}
 function setCharts(mode){state.chartMode=mode;['sensors','attitude'].forEach(m=>{$('tab-'+m).classList.toggle('active',m===mode);$('tab-'+m).setAttribute('aria-pressed',String(m===mode))});for(let i=0;i<3;i++){$('chart-title-'+i).textContent=mode==='sensors'?['Акселерометр','Гироскоп','Магнитометр'][i]:['Крен · Roll','Тангаж · Pitch','Рыскание · Yaw'][i];$('chart-'+i).setAttribute('aria-label',$('chart-title-'+i).textContent);$('chart-unit-'+i).textContent=mode==='sensors'?['g','°/с','µT'][i]:'°';$('chart-legend-'+i).innerHTML=mode==='sensors'?COLORS.map((c,j)=>'<span style="--c:'+c+'">'+['X','Y','Z'][j]+'</span>').join(''):'<span style="--c:'+COLORS[i]+'">Ориентация</span>'}}
 $('tab-sensors').onclick=()=>setCharts('sensors');$('tab-attitude').onclick=()=>setCharts('attitude');$('window').onchange=e=>state.window=Number(e.target.value);
-$('export').onclick=()=>{if(!state.history.length){setMessage('Нет пакетов для экспорта.');return}const head=['source','time_s','sensor_t_us','seq','qw','qx','qy','qz','roll_deg','pitch_deg','yaw_deg','ax_g','ay_g','az_g','gx_dps','gy_dps','gz_dps','mx','my','mz','bx_dps','by_dps','bz_dps','dt_s','acc_used','mag_used','mag_age_ms','orientation_source','time_basis','filter_dt_s','mag_unit','browser_acc_used','browser_mag_used'];const rows=state.history.map(p=>[p.mode,p.t,p.tUs??'',p.seq??'',...(p.q??[null,null,null,null]),...p.rpy,...p.a,...p.g,...p.m,...p.b,p.dt,p.accUsed===null?'':Number(p.accUsed),p.magUsed===null?'':Number(p.magUsed),p.magAge??'',p.estimated?'browser_ahrs':p.mode==='demo'?'demo':'firmware',p.timeBasis,p.filterDt??'',p.magUnit,p.estimated?Number(p.filterAcc):'',p.estimated?Number(p.filterMag):''].join(','));const blob=new Blob([head.join(',')+'\n'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='qav250-'+state.mode+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('export').onclick=()=>{if(!state.history.length){setMessage('Нет пакетов для экспорта.');return}const head=['source','time_s','sensor_t_us','seq','qw','qx','qy','qz','roll_deg','pitch_deg','yaw_deg','ax_g','ay_g','az_g','gx_dps','gy_dps','gz_dps','mx','my','mz','bx_dps','by_dps','bz_dps','dt_s','acc_used','mag_used','mag_age_ms','orientation_source','time_basis','filter_dt_s','mag_unit','browser_acc_used','browser_mag_used','coordinate_frame','mount_qw','mount_qx','mount_qy','mount_qz','heading_zero_deg'];const rows=state.history.map(p=>[p.mode,p.t,p.tUs??'',p.seq??'',...(p.q??[null,null,null,null]),...p.rpy,...p.a,...p.g,...p.m,...p.b,p.dt,p.accUsed===null?'':Number(p.accUsed),p.magUsed===null?'':Number(p.magUsed),p.magAge??'',p.estimated?'browser_ahrs':p.mode==='demo'?'demo':'firmware',p.timeBasis,p.filterDt??'',p.magUnit,p.estimated?Number(p.filterAcc):'',p.estimated?Number(p.filterMag):'',p.coordinateFrame,...p.mountQ,p.headingZero].join(','));const blob=new Blob([head.join(',')+'\n'+rows.join('\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='qav250-'+state.mode+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 $('log-file').onchange=async e=>{const file=e.target.files[0];if(!file)return;if(state.port){setMessage('Сначала отключите USB.');return}if(file.size>20*1024*1024){setMessage('Откройте журнал размером до 20 МБ.');e.target.value='';return}try{const text=await file.text(),packets=[];let errors=0;const parser=new TelemetryParser(p=>packets.push(p),()=>errors++);parser.feed(text);parser.flush();if(!packets.length){setMessage('В журнале не найдено полных пакетов. Нужен исходный текстовый вывод или JSONL указанного формата.');return}setMode('log');state.errors=errors;packets.forEach((p,i)=>receive(p,{hostNow:i*100,logTime:i*.1}));state.lastRx=null;state.arrivals=[];const synthetic=packets.some(p=>p.tUs===null);$('log-info').textContent=file.name+' · '+packets.length+' пакетов'+(synthetic?' · для строк без timestamp интервал условно 100 мс':' · время устройства');$('scene-source').textContent='Журнал · последняя ориентация';setMessage('Журнал загружен. '+(synthetic?'Без timestamp временная шкала условная: 10 Гц. Гироскоп журнала не интегрируется. ':'')+'Показаны последние 60 секунд.');}catch(e){setMessage('Не удалось прочитать журнал: '+e.message)}finally{e.target.value=''}};
-function format(v,n=1){return finite(v)?v.toFixed(n):'—'}
+function format(v,n=1){return finite(v)?(Math.abs(v)<.5*10**-n?0:v).toFixed(n):'—'}
 function updateUI(now){
- serialDiagnostics(now);const p=state.display,age=state.lastRx===null?null:Math.max(0,now-state.lastRx),stale=state.mode==='serial'&&(!state.port||age===null||age>1500);
+ serialDiagnostics(now);updateCoordinateUI(now);const p=state.display,age=state.lastRx===null?null:Math.max(0,now-state.lastRx),stale=state.mode==='serial'&&(!state.port||age===null||age>1500);
  let hz=0;if(state.arrivals.length>1){const arrivals=state.arrivals;hz=(arrivals.length-1)*1000/(arrivals.at(-1)-arrivals[0])}if(age>2500)hz=0;if(state.mode==='log'){const h=state.history;hz=h.length>1?(h.length-1)/(h.at(-1).t-h[0].t):0}
  $('rx-rate').textContent=format(hz,1);$('age-value').textContent=age===null?'—':Math.round(age).toLocaleString('ru');$('fresh-dot').style.background=stale?'var(--orange)':'var(--lime)';
  if(state.mode==='serial'){$('source-badge').textContent=state.port?(stale?(state.bytes?'● НЕТ КАДРОВ':'● ОЖИДАНИЕ USB'):'● USB LIVE'):'● ОТКЛЮЧЕНО';$('source-badge').className='chip '+(stale?'warning':'')}
@@ -176,14 +261,14 @@ function updateUI(now){
  const magLabel=p.magUnit==='counts'?'отсч.':'µT';
  $('raw-title').textContent=p.estimated?'Ориентация рассчитывается в браузере':'Настройки единиц ax…mz';
  $('raw-note').textContent=p.estimated?'В пакете нет корректной ориентации из прошивки. Графики показывают измерения; 3D использует '+(p.timeBasis==='log-assumed'?'ACC/MAG без интегрирования гироскопа. ':'комплементарный фильтр, не EKF. ')+(p.timeBasis==='usb-arrival'?'Время по приёму USB — приблизительное. ':'')+'Оси ACC/GYRO/MAG должны совпадать.':'';
- $('raw-unit-controls').classList.toggle('hidden',!p.flat);$('raw-unit-note').classList.toggle('hidden',!p.flat);$('zero-heading').classList.toggle('hidden',!p.estimated||state.mode==='log');
+ $('raw-unit-controls').classList.toggle('hidden',!p.flat);$('raw-unit-note').classList.toggle('hidden',!p.flat);
  if(state.mode!=='demo')$('scene-source').textContent=!p.q?'Ориентация недоступна · нужны данные ACC':(stale?'Последняя ориентация · ':'')+(p.estimated?'Оценка браузера по датчикам':'Ориентация из прошивки');
- $('heading-note').textContent=p.estimated?'Ноль — при запуске оценки браузера.':'Курс передан прошивкой.';
+ $('heading-note').textContent=state.mode==='demo'?'Синтетический курс модели.':p.coordinateFrame==='body_calibrated'?'Курс корпуса после калибровки IMU.':imuFrame.heading?'Курс относительно выбранного нуля.':p.estimated?'Ноль — при запуске оценки браузера.':'Курс передан прошивкой.';
  $('dt-label').textContent=p.estimated?'Интервал AHRS':'Шаг из прошивки';const dt=p.estimated?p.filterDt:p.dt;
  $('dt-value').textContent=finite(dt)?format(dt*1000,2):'—';$('dt-note').textContent=p.estimated?(p.timeBasis==='usb-arrival'?'По приёму USB, приблизительно':p.timeBasis==='device'?'Разность timestamp устройства':'Журнал без времени: только ACC/MAG'):(finite(p.dt)?(state.mode==='demo'?'Задано в демо':'По переданному dt')+' · '+format(1/p.dt,1)+' Гц':'dt не передан прошивкой');
  $('omega-value').textContent=vec(p.g,3)?format(norm(p.g),1):'—';
  ['roll','pitch','yaw'].forEach((id,i)=>$(id).textContent=finite(p.rpy[i])?format(p.rpy[i],1)+'°':'—');$('needle').style.transform='rotate('+(finite(p.rpy[2])?-p.rpy[2]:0)+'deg)';
- ['qw','qx','qy','qz'].forEach((id,i)=>$(id).textContent=format(p.q?.[i],4));$('q-label').textContent=p.estimated?'q браузера · w x y z':p.fromEuler?'q восстановлен из переданных RPY':'Кватернион · w x y z';
+ ['qw','qx','qy','qz'].forEach((id,i)=>$(id).textContent=format(p.q?.[i],4));$('q-label').textContent='q '+(p.coordinateFrame==='imu_native'?'IMU':'корпуса')+' → мир · w x y z';
  const acc=p.estimated?p.filterAcc:p.accUsed,mag=p.estimated?p.filterMag:p.magUsed;
  $('acc-health').textContent=acc===null?'Статус не передан':(acc?'USED':'REJECTED')+(p.estimated?' · браузер':' · прошивка');$('acc-health').style.color=acc?'var(--green)':'var(--orange)';
  $('mag-health').textContent=(mag===null?'Статус н/д':mag?'USED':'REJECTED')+(p.estimated?' · браузер':'')+(p.magAge===null?' · возраст н/д':' · '+format(p.magAge,0)+' мс');$('mag-health').style.color=mag&&(p.magAge===null||p.magAge<500)?'var(--green)':'var(--orange)';
@@ -229,4 +314,4 @@ let lastUI=0,lastChart=0,lastFrame=0;const reduced=window.matchMedia('(prefers-r
 function tick(now){try{if(state.mode==='serial')liveParser.idle(now);if(state.mode==='demo'&&now-state.lastDemo>=20){const t=(now-state.start)/1000;const p=demoPacket(t);p.seq=null;receive(p);state.lastDemo=now}if(now-lastUI>=100){updateUI(now);lastUI=now}if(now-lastChart>=100){drawCharts();lastChart=now}if(!reduced||now-lastFrame>=100){drawScene(now);lastFrame=now}}catch(e){state.renderError=e.message;setMessage('Ошибка отображения: '+e.message+'. Приём Serial продолжается.')}finally{requestAnimationFrame(tick)}}
 setMode('demo');requestAnimationFrame(tick);
 /* Optional read-only agent access. No permission prompts or port selection can be bypassed. */
-if(document.modelContext?.registerTool){try{const lifecycle=new AbortController();Promise.resolve(document.modelContext.registerTool({name:'read_qav250_telemetry',description:'Read the visible QAV250 telemetry, source mode and data freshness. Demo values are synthetic.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute(input){if(input&&Object.keys(input).length)throw new Error('No parameters expected');const p=state.display;return{mode:state.mode,connected:!!state.port,paused:state.paused,age_ms:state.lastRx===null?null:performance.now()-state.lastRx,packet:p?{q:p.q,rpy_deg:p.rpy,a_g:p.a,g_dps:p.g,mag:p.m,mag_unit:p.magUnit,dt_s:p.dt,orientation_source:p.estimated?'browser_ahrs':p.mode==='demo'?'demo':'firmware',time_basis:p.timeBasis,filter_dt_s:p.filterDt??null}:null}}},{signal:lifecycle.signal})).catch(()=>{});window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true})}catch{}}
+if(document.modelContext?.registerTool){try{const lifecycle=new AbortController();Promise.resolve(document.modelContext.registerTool({name:'read_qav250_telemetry',description:'Read the visible QAV250 telemetry, source mode and data freshness. Demo values are synthetic.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute(input){if(input&&Object.keys(input).length)throw new Error('No parameters expected');const p=state.display;return{mode:state.mode,connected:!!state.port,paused:state.paused,age_ms:state.lastRx===null?null:performance.now()-state.lastRx,packet:p?{q:p.q,rpy_deg:p.rpy,a_g:p.a,g_dps:p.g,mag:p.m,mag_unit:p.magUnit,dt_s:p.dt,orientation_source:p.estimated?'browser_ahrs':p.mode==='demo'?'demo':'firmware',coordinate_frame:p.coordinateFrame,mount_q:p.mountQ,heading_zero_deg:p.headingZero,time_basis:p.timeBasis,filter_dt_s:p.filterDt??null}:null}}},{signal:lifecycle.signal})).catch(()=>{});window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true})}catch{}}

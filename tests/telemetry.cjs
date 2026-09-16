@@ -21,16 +21,18 @@ function element(id) {
   return elements.get(id);
 }
 let exportedBlob;
+const storage = new Map();
 const sandbox = {
   document: { getElementById: element, createElement: () => ({ click() {} }) },
   window: { matchMedia: () => ({ matches: false }), devicePixelRatio: 1 },
   navigator: {}, performance: { now: () => clock }, requestAnimationFrame() {},
   getComputedStyle: () => ({ fontFamily: 'Arial' }), setTimeout() {},
   TextDecoder, TextEncoder, Blob,
+  localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
   URL: { createObjectURL: b => { exportedBlob = b; return 'blob:test'; }, revokeObjectURL() {} },
 };
 vm.createContext(sandbox);
-vm.runInContext(source + '\nthis.api={normalizePacket,TelemetryParser,BrowserAHRS,state,setMode,receive,updateUI,drawScene,drawCharts,acceptSerialBytes,rawUnits,togglePause,resetBrowserView,setCharts};', sandbox);
+vm.runInContext(source + '\nthis.api={normalizePacket,TelemetryParser,BrowserAHRS,state,setMode,receive,updateUI,drawScene,drawCharts,acceptSerialBytes,rawUnits,togglePause,resetBrowserView,setCharts,IMUFrame,imuFrame,quatEuler,qmul,qconj,rotation,mv,mtv,determinant,captureStablePose,zeroHeading};', sandbox);
 const a = sandbox.api, plain = v => JSON.parse(JSON.stringify(v));
 const sample = { ax: .1911, ay: -.1360, az: .9778, gx: .183, gy: -.183, gz: -.183, mx: -11, my: 39, mz: 32 };
 const close = (actual, expected, tolerance = 1e-6) => assert(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
@@ -121,4 +123,117 @@ assert.equal(element('matrix').children[0].textContent, '—'); element('export'
 a.setMode('serial'); const decoder = new TextDecoder();
 for (let i = 0; i < 10; i++) { clock += 20; const bytes = new TextEncoder().encode(JSON.stringify(sample) + '\r\n'); a.acceptSerialBytes(bytes.slice(0, 20), decoder); a.acceptSerialBytes(bytes.slice(20), decoder); }
 assert.equal(a.state.count, 10); assert.equal(a.state.errors, 0); assert.equal(a.state.display.timeBasis, 'usb-arrival');
-console.log(`PASS: ${expected} diagnostic frames, 0 rejected; raw/firmware paths, tilt/yaw/gyro physics, timing gaps, units, model/matrix/charts, pause, CSV, chunked Serial.`);
+// Native sensor S can be rotated sideways, tilted 10 degrees, or mounted upside down.
+// Build a physical board orientation independently of the measured sensor attitude.
+const radians = Math.PI / 180;
+const closeVector = (actual, target, tolerance = 1e-6) => target.forEach((v, i) => close(actual[i], v, tolerance));
+function sensorPacket(mount, rpy, heading = 0, firmware = true) {
+  const boardQ = a.quatEuler(rpy), boardR = a.rotation(boardQ), mountR = a.rotation(mount);
+  const sensorVector = v => a.mtv(mountR, v);
+  const packet = { a_g: sensorVector(a.mtv(boardR, [0, 0, 1])),
+    g_dps: sensorVector([0, 0, 0]), m_uT: sensorVector(a.mtv(boardR, [25, 0, -40])),
+    bias_dps: sensorVector([.1, -.2, .3]) };
+  if (firmware) packet.q = a.qmul(a.quatEuler([0, 0, heading]), a.qmul(boardQ, mount));
+  return packet;
+}
+for (const angles of [[10, 0, 90], [-10, 0, -90], [10, -7, 100], [0, 10, 0], [180, 0, 0], [0, 180, 0], [0, 0, 180]]) {
+  const mount = a.quatEuler(angles), neutral = sensorPacket(mount, [0, 0, 0], 57), forward = sensorPacket(mount, [0, 30, 0], 57);
+  const frame = new a.IMUFrame(); frame.setMount(a.IMUFrame.fromPoses(neutral.a_g, forward.a_g)); frame.reference(neutral.q);
+  close(a.determinant(a.rotation(frame.sensorToBody)), 1);
+  for (const rpy of [[0, 0, 0], [0, 35, 0], [0, -35, 0], [25, 0, 0], [-25, 0, 0], [0, 0, 40], [17, -23, 61]]) {
+    const input = sensorPacket(mount, rpy, 57), p = a.normalizePacket(input);
+    const bodyG = [1, 2, 3]; p.g = a.mtv(a.rotation(mount), bodyG);
+    p.mode = 'serial'; frame.apply(p); const firstQ = p.q.slice();
+    closeVector(p.rpy, rpy); closeVector(p.g, bodyG); closeVector(p.b, [.1, -.2, .3]);
+    closeVector(a.mv(a.rotation(p.q), p.a), [0, 0, 1]);
+    closeVector(a.mv(a.rotation(p.q), p.m), [25, 0, -40]);
+    closeVector(p.sensor.a, input.a_g); assert.equal(p.coordinateFrame, 'body_calibrated');
+    frame.apply(p); closeVector(p.q, firstQ); // No double correction on redraw/history.
+    const front = a.mv(a.rotation(p.q), [1, 0, 0]);
+    if (rpy[0] === 0 && rpy[2] === 0) close(front[2], -Math.sin(rpy[1] * radians));
+  }
+}
+assert.throws(() => a.IMUFrame.fromPoses([0, 0, 1], [0, 0, 1]), /15–60/);
+assert.throws(() => a.IMUFrame.fromPoses([0, 0, 1], [1, 0, 0]), /15–60/);
+assert.throws(() => a.IMUFrame.fromPoses([0, 0, 2], [0, 0, 1]), /1 g/);
+assert.throws(() => new a.IMUFrame().setMount([0, 0, 0, 0]), /Некорректная/);
+
+// Exercise the actual two-button workflow with a 90-degree sideways / 10-degree tilt mount.
+const tiltedMount = a.quatEuler([10, 0, 90]);
+a.setMode('serial'); a.state.port = {};
+function holdPose(rpy, options = {}) {
+  for (let i = 0; i < 15; i++) {
+    clock += 100;
+    const input = sensorPacket(tiltedMount, rpy, 37, options.firmware !== false);
+    if (options.moving) input.g_dps = [20, 0, 0];
+    if (options.firmware === false) delete input.bias_dps;
+    a.receive(a.normalizePacket(input), { hostNow: clock });
+  }
+}
+holdPose([0, 0, 0]); element('calibrate-level').onclick();
+assert.match(element('frame-note').textContent, /Шаг 1 готов/);
+holdPose([0, 30, 0]); element('calibrate-forward').onclick();
+assert(a.imuFrame.calibrated); assert(storage.has('qav250.imu-mount.v1'));
+// A fresh page loads the profile, while malformed browser storage cannot break startup.
+function reloadFrame() {
+  const reload = { ...sandbox, document: { ...sandbox.document, getElementById: id => element('reload-' + id) } };
+  vm.createContext(reload); vm.runInContext(source + '\nthis.reloadedFrame=imuFrame;', reload);
+  return reload.reloadedFrame;
+}
+const profile = storage.get('qav250.imu-mount.v1');
+closeVector(reloadFrame().sensorToBody, a.imuFrame.sensorToBody);
+storage.set('qav250.imu-mount.v1', '{broken'); assert(!reloadFrame().calibrated);
+storage.set('qav250.imu-mount.v1', profile);
+closeVector(a.state.display.rpy, [0, 30, 0]); closeVector(a.state.history[0].rpy, [0, 0, 0]);
+assert(a.state.history.every(p => p.coordinateFrame === 'body_calibrated'));
+holdPose([0, 0, 0]); a.updateUI(clock);
+assert.equal(element('pitch').textContent, '0.0°');
+close(a.state.display.a[0], 0); close(a.state.display.a[1], 0); close(a.state.display.a[2], 1);
+assert.equal(element('packet-frame').textContent, 'BODY');
+
+// An actual calibrated pitch must move the nose down, and feed the same matrix/graphs/CSV.
+holdPose([0, 30, 0]); a.updateUI(clock); a.drawScene(clock); a.drawCharts();
+assert.equal(element('pitch').textContent, '30.0°');
+close(Number(element('matrix').children[6].textContent), -.5);
+close(Number(element('a0').textContent), -.5);
+assert(element('scene').context.calls.some(c => c[0] === 'fillText' && c[1] === 'FRONT'));
+element('export').onclick(); const calibratedExport = exportedBlob;
+
+// Heading zero is a rotation of world around Z; it must not flatten roll/pitch or rotate sensors.
+holdPose([12, -20, 45]); const preZeroA = plain(a.state.display.a), preZeroG = plain(a.state.display.g);
+element('zero-heading').onclick();
+closeVector(a.state.display.rpy, [12, -20, 0]); closeVector(a.state.display.a, preZeroA); closeVector(a.state.display.g, preZeroG);
+const storedMount = plain(a.imuFrame.sensorToBody);
+a.resetBrowserView(); closeVector(a.imuFrame.sensorToBody, storedMount);
+
+// Raw AHRS remains in native axes; the correction applies once after filtering.
+a.setMode('serial'); a.state.port = {};
+holdPose([0, 0, 0], { firmware: false });
+for (let i = 0; i < 6; i++) holdPose([0, 30, 0], { firmware: false });
+closeVector(a.state.display.rpy, [0, 30, 0], .01);
+assert(a.state.display.estimated); closeVector(a.state.display.a, [-.5, 0, Math.sqrt(.75)]);
+
+// Reject stale/moving calibration; demo and logs cannot overwrite a physical mounting profile.
+holdPose([0, 30, 0], { moving: true }); assert.throws(() => a.captureStablePose(), /движется/);
+clock += 2000; assert.throws(() => a.captureStablePose(), /свежих/);
+a.setMode('demo');
+const demo = a.normalizePacket({ q: a.quatEuler([3, 6, 9]), a_g: [.1, .2, .97] }); a.receive(demo);
+closeVector(demo.rpy, [3, 6, 9]); closeVector(demo.a, [.1, .2, .97]);
+assert.throws(() => a.captureStablePose(), /USB/); assert(a.imuFrame.calibrated);
+a.setMode('log'); assert.throws(() => a.captureStablePose(), /USB/);
+
+// Missing signals remain unknown after calibration, even with no orientation to display.
+a.setMode('serial'); a.state.port = {};
+a.receive(a.normalizePacket({ g_dps: a.mtv(a.rotation(tiltedMount), [1, 2, 3]) }));
+assert.equal(a.state.display.q, null); closeVector(a.state.display.g, [1, 2, 3]);
+assert.deepEqual(plain(a.state.display.a), [null, null, null]);
+element('calibrate-reset').onclick(); assert(!a.imuFrame.calibrated); assert(!storage.has('qav250.imu-mount.v1'));
+closeVector(a.state.display.g, a.mtv(a.rotation(tiltedMount), [1, 2, 3]));
+
+calibratedExport.text().then(csv => {
+  const rows = csv.trim().split('\n').map(row => row.split(',')), header = rows.shift(), last = rows.at(-1);
+  assert.equal(last.length, header.length); assert.equal(last[header.indexOf('coordinate_frame')], 'body_calibrated');
+  close(Number(last[header.indexOf('pitch_deg')]), 30); close(Number(last[header.indexOf('ax_g')]), -.5);
+  assert(header.includes('mount_qw')); assert(header.includes('heading_zero_deg'));
+  console.log(`PASS: ${expected} telemetry frames; raw/firmware AHRS, coordinate calibration (7 mounts, all axes), 10-degree offset, two-step UI, heading, history, matrix/model/graphs/CSV, missing data and reset.`);
+}).catch(error => { console.error(error); process.exitCode = 1; });
