@@ -1,0 +1,31 @@
+menu "QAV250"
+
+    config QAV250_I2C_SDA_GPIO
+        int "I2C SDA GPIO"
+        range 0 48
+        default 40
+
+    config QAV250_I2C_SCL_GPIO
+        int "I2C SCL GPIO"
+        range 0 48
+        default 39
+
+    choice QAV250_TELEMETRY_FORMAT
+        prompt "Serial telemetry format"
+        default QAV250_OUTPUT_RAW_JSON
+
+        config QAV250_OUTPUT_RAW_JSON
+            bool "Raw sensor JSON (ax..mz, browser AHRS)"
+            help
+                Matches the working nine-axis dashboard mode.
+                Includes read timestamps and sequence numbers.
+                The MEKF still runs but its quaternion is not transmitted.
+
+        config QAV250_OUTPUT_EKF_JSON
+            bool "Firmware MEKF JSON (q + sensors)"
+            help
+                Send the firmware quaternion directly to the dashboard.
+                Read docs/QAV250_EKF_review.md for filter limitations.
+    endchoice
+
+endmenu

@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "bmi2.c"
         "bmi270.c"
+        "bmm150.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_driver_i2c
+    REQUIRES esp_driver_i2c esp_timer
 )

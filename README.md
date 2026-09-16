@@ -1,191 +1,137 @@
-# ESP32-S3 + BMI270 I2C Project
+# QAV250 · ESP32-S3 + BMI270 + BMM150
 
-This project demonstrates how to interface an **ESP32-S3** with a **Bosch BMI270 IMU** using I2C and ESP-IDF.
+Полный комплект для чтения 9 осей датчиков: прошивка ESP-IDF, локальная панель с 3D-моделью QAV250, графиками, углами, кватернионом и матрицей вращения. Панель работает на компьютере друга и не требует доступа к личному сайту или аккаунту ChatGPT.
 
-The project reads accelerometer data from the BMI270 and outputs the X, Y, and Z acceleration values through the serial monitor.
+По умолчанию ESP32 отправляет `ax…mz`, а браузер рассчитывает ориентацию — тот же режим, который был проверен с работающим устройством. В комплект добавлены `t_us` и `seq`. При желании можно включить передачу кватерниона MEKF из ESP32.
 
-## Hardware
+## Быстрый запуск для друга
 
-- ESP32-S3
-- Bosch BMI270 IMU
-- I2C interface
+1. Скачай репозиторий через **Code → Download ZIP** и распакуй, либо выполни:
 
-### I2C Configuration
+   ```bash
+   git clone https://github.com/Kaziyev/esp-idf-workspace.git
+   cd esp-idf-workspace
+   ```
 
-| Signal | ESP32-S3 |
+2. Если ESP32 уже отправляет JSON с `ax,ay,az,gx,gy,gz,mx,my,mz`, перепрошивка не нужна. Для новой платы собери и прошей проект по инструкции ниже.
+3. Установи **Python 3**. В Windows запусти `start_dashboard.bat`; в Linux/macOS — `sh start_dashboard.sh`.
+4. Открой **http://localhost:8000** в настольном **Chrome или Edge**. Оставь окно сервера открытым.
+5. Закрой Serial Monitor, нажми **«Подключить USB»**, выбери COM-порт ESP32 и скорость **115200 baud**. Дождись конца калибровки. Поверни плату: должны изменяться графики и положение модели.
+
+Без устройства доступен режим **«Демо»**. В режиме USB вращение пропеллеров не анимируется: телеметрия не содержит RPM моторов.
+
+Ручной запуск панели из корня репозитория:
+
+```bash
+python scripts/serve_dashboard.py
+```
+
+В Windows также можно использовать `py -3`, в Linux/macOS — `python3`. Если порт 8000 занят:
+
+```bash
+python scripts/serve_dashboard.py --port 8001
+```
+
+Сервер использует стандартную библиотеку Python и слушает только `127.0.0.1`. Он отдаёт папку `web`; обмен с ESP32 выполняет браузер. Не нужно устанавливать npm-пакеты или скачивать графические библиотеки. Для остановки сервера нажми **Ctrl+C**.
+
+## Подключение датчиков
+
+Оба датчика подключаются к одной I2C-шине ESP32-S3. Базовая схема — для модулей с логикой **3,3 В**; проверь маркировку конкретного breakout-модуля.
+
+| Сигнал | ESP32-S3 | BMI270 | BMM150 |
+|---|---|---|---|
+| Питание | 3V3 | VCC/VDD | VCC/VDD |
+| Земля | GND | GND | GND |
+| Данные I2C | GPIO40 | SDA | SDA |
+| Тактирование I2C | GPIO39 | SCL | SCL |
+
+Частота I2C — 100 кГц. Проверь наличие подтяжек SDA/SCL к 3,3 В на модулях; одних внутренних подтяжек ESP32 может быть недостаточно. [Описание I2C ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32s3/api-reference/peripherals/i2c.html).
+
+Прошивка ищет BMI270 по адресам `0x68/0x69`, BMM150 — `0x10…0x13`. Выводы SDA/SCL меняются в `idf.py menuconfig → QAV250`. Оси BMI270 и BMM150 должны быть совмещены физически либо через `remap_mag_axes()` в `main.c`.
+
+## Сборка и прошивка ESP32-S3
+
+Используется **ESP-IDF v5.4.1**, как в исходном `sdkconfig`. Драйверы Bosch уже включены в репозиторий, дополнительных загрузок через Component Manager не требуется. [Установка ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32s3/get-started/index.html).
+
+Открой терминал с активированным ESP-IDF. В Windows это **ESP-IDF PowerShell/Command Prompt** или терминал расширения ESP-IDF в VS Code.
+
+Из корня репозитория:
+
+```bash
+cd apps/i2c_imu
+idf.py set-target esp32s3
+idf.py build
+```
+
+Для первой сборки `set-target` применяет настройки `sdkconfig.defaults`; эта команда сбрасывает локальные изменения конфигурации. При последующих сборках достаточно `idf.py build`.
+
+Прошивка и проверка вывода, пример для Windows:
+
+```powershell
+idf.py -p COM6 flash monitor
+```
+
+**COM6 — пример**, выбери порт своей платы. В Linux команда может выглядеть так:
+
+```bash
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+На старте удерживай плату неподвижно примерно 3 секунды: прошивка усредняет ACC/GYRO и MAG. Дождись `MEKF initialized`, затем JSON-строк. Выход из монитора — **Ctrl+]**. После этого подключай тот же порт в панели.
+
+Сохранены параметры исходной платы: DIO, 80 МГц, flash 2 МБ, UART 115200. Стек основной задачи увеличен до 8192 байт для локальных матриц MEKF. Если у твоей платы другие параметры памяти, проверь **Serial flasher config** в `idf.py menuconfig` перед прошивкой. `idf.py flash` использует адреса и параметры из сборки; вручную вводить смещения бинарных файлов не нужно.
+
+Основной вывод настроен на UART через USB–UART мост, как в рабочей диагностике. Если используешь native USB ESP32-S3, выбери нужную консоль в **Component config → ESP System Settings → Channel for console output**, затем пересобери проект. Нужен USB-разъём, на котором действительно виден вывод прошивки.
+
+## Два режима ориентации
+
+Настройка: `idf.py menuconfig → QAV250 → Serial telemetry format`.
+
+| Режим | Что передаёт ESP32 | Откуда берётся ориентация модели |
+|---|---|---|
+| **Raw sensor JSON** — по умолчанию | `ax…mz`, `t_us`, `seq`, возраст MAG | Комплементарный AHRS браузера |
+| **Firmware MEKF JSON** | `q`, ACC/GYRO/MAG, bias, dt, статусы | Кватернион MEKF из прошивки напрямую |
+
+После изменения режима выполни `idf.py build` и `idf.py -p COM6 flash`, подставив свой порт. Панель распознает формат автоматически. В обоих режимах основной C-код выполняет MEKF; настройка выбирает передаваемые поля. Само наличие девяти каналов в JSON не означает передачу результата MEKF.
+
+Единицы этого комплекта: **ACC — g, GYRO — °/с, MAG — µT**. В панели оставь эти значения в настройках `ax…mz`. Развёрнутое описание полей, времени и систем координат: [docs/TELEMETRY.md](docs/TELEMETRY.md).
+
+## Что находится в репозитории
+
+| Путь | Назначение |
 |---|---|
-| SDA | GPIO 40 |
-| SCL | GPIO 39 |
+| `apps/i2c_imu/main/main.c` | Основная прошивка: I2C, BMI270, BMM150, MEKF, JSON |
+| `apps/i2c_imu/main/bmi*.c/.h`, `bmm150*.c/.h` | Драйверы Bosch |
+| `apps/i2c_imu/main/Kconfig.projbuild` | Выводы I2C и режим телеметрии |
+| `apps/i2c_imu/sdkconfig.defaults` | Воспроизводимая базовая конфигурация |
+| `web/index.html` | Разметка панели |
+| `web/styles.css` | Оформление |
+| `web/app.js` | Serial-приём, AHRS, графики, геометрия 3D-модели |
+| `scripts/serve_dashboard.py` | Локальный HTTP-сервер |
+| `start_dashboard.bat`, `start_dashboard.sh` | Быстрый запуск панели |
+| `tests/telemetry.cjs` | Проверка форматов и математики панели через Node.js |
+| `docs/QAV250_EKF_review.md` | Разбор исходного фильтра и его ограничений |
+| `THIRD_PARTY.md`, `licenses/` | Происхождение и лицензии драйверов |
 
-Detected BMI270 I2C address:
+При переносе панели отдельно копируй **всю папку `web`**, а не один HTML: CSS и JavaScript теперь вынесены в отдельные файлы.
 
-```text
-0x69
-```
+## Если нет движения модели
 
-Expected BMI270 CHIP ID:
+- **Байты = 0:** проверь COM-порт, USB-разъём и канал консоли; закрой другие программы, занимающие порт.
+- **Кадры = 0 при растущих байтах:** открой исходные строки в диагностике. Дождись калибровки; затем проверь JSON и скорость 115200.
+- **Графики меняются, модель стоит:** отключи паузу, проверь единицы ACC/GYRO. Для начальной ориентации браузеру нужен корректный ACC с нормой около 1 g.
+- **Повороты перепутаны:** проверь реальные оси плат и `remap_mag_axes()`. Визуальная модель использует X вперёд, Y влево, Z вверх.
+- **Курс плавает:** проверь магнитные помехи и калибровку BMM150. Компенсация Bosch не заменяет калибровку всей сборки.
+- **Ошибка в середине работы:** нажми «Копировать диагностику» и сохрани текст с исходными строками.
 
-```text
-0x24
-```
+## Проверки и границы
 
----
-
-# Build
-
-The project is built inside the ESP-IDF Docker container.
-
-Open the terminal inside the development container and go to the project directory:
-
-```bash
-cd /workspace/apps/i2c_imu
-```
-
-Optional: clean the previous build:
-
-```bash
-idf.py fullclean
-```
-
-Build the project:
+Панель перенесена из рабочей версии Serial 1.3. Сведения о проверенной сборке: [docs/VALIDATION.md](docs/VALIDATION.md). Проверка JavaScript включает приём 120 строк фактической диагностики, форматы raw/q/RPY, знаки наклона и курса, интегрирование гироскопа, разрывы времени, модель, матрицу и графики. Запуск проверки, если установлен Node.js:
 
 ```bash
-idf.py build
+node tests/telemetry.cjs
 ```
 
-A successful build should finish with:
+Основной C-код подготовлен на основе ранее предоставленной версии BMI270 + BMM150 + MEKF, а не восстановлен побайтно из уже прошитого устройства. Он сохраняет ограничения исходного фильтра: настройки MAG — заглушки, оси требуют проверки, внутренний `dt` MEKF берётся из ticks, часть ускорений и магнитных помех проходит проверки нормы. Подробнее — [разбор EKF](docs/QAV250_EKF_review.md).
 
-```text
-Project build complete.
-```
-
-The generated application binary will be located at:
-
-```text
-build/i2c_imu.bin
-```
-
----
-
-# Flashing from Windows PowerShell
-
-Open PowerShell in the project directory:
-
-```powershell
-cd "D:\Загрузки\course-iot-with-esp-idf-main\course-iot-with-esp-idf-main\workspace\apps\i2c_imu"
-```
-
-Check available COM ports if necessary:
-
-```powershell
-python -m serial.tools.list_ports -v
-```
-
-In the current setup, the ESP32-S3 uses:
-
-```text
-COM6
-```
-
-Flash the firmware:
-
-```powershell
-python -m esptool --port COM6 --chip esp32s3 --baud 460800 write-flash --flash-mode dio --flash-size 2MB --flash-freq 80m 0x0 .\build\bootloader\bootloader.bin 0x8000 .\build\partition_table\partition-table.bin 0x10000 .\build\i2c_imu.bin
-```
-
-A successful flash should finish with messages similar to:
-
-```text
-Hash of data verified.
-Hard resetting via RTS pin...
-```
-
----
-
-# Serial Monitor
-
-Start the serial monitor:
-
-```powershell
-python -m serial.tools.miniterm COM6 115200
-```
-
-The expected output is similar to:
-
-```text
-I2C bus created
-FOUND device at 0x69
-DIRECT CHIP_ID = 0x24
-BMI270 initialized successfully!
-Accelerometer configured
-Accelerometer enabled!
-
-RAW X=120 Y=-54 Z=16280 | g X=0.007 Y=-0.003 Z=0.994
-```
-
-To exit the serial monitor, press:
-
-```text
-Ctrl + ]
-```
-
-> Note: COM port numbers may be different on another computer. Use `python -m serial.tools.list_ports -v` to find the correct port.
-
----
-
-# Typical Development Workflow
-
-After changing the source code:
-
-### 1. Build inside the Docker/ESP-IDF container
-
-```bash
-cd /workspace/apps/i2c_imu
-idf.py build
-```
-
-### 2. Flash from Windows PowerShell
-
-```powershell
-python -m esptool --port COM6 --chip esp32s3 --baud 460800 write-flash --flash-mode dio --flash-size 2MB --flash-freq 80m 0x0 .\build\bootloader\bootloader.bin 0x8000 .\build\partition_table\partition-table.bin 0x10000 .\build\i2c_imu.bin
-```
-
-### 3. Monitor the sensor data
-
-```powershell
-python -m serial.tools.miniterm COM6 115200
-```
-
----
-
-# BMI270 Initialization Process
-
-The program performs the following steps:
-
-1. Creates the ESP32-S3 I2C bus.
-2. Scans for the BMI270.
-3. Detects the sensor at address `0x69`.
-4. Reads the `CHIP_ID` register.
-5. Verifies that the CHIP ID is `0x24`.
-6. Initializes the BMI270 using the Bosch Sensor API.
-7. Configures the accelerometer.
-8. Enables the accelerometer.
-9. Continuously reads X, Y, and Z acceleration data.
-10. Converts raw accelerometer values into `g`.
-
----
-
-# Project Structure
-
-```text
-i2c_imu/
-├── CMakeLists.txt
-└── main/
-    ├── CMakeLists.txt
-    ├── main.c
-    ├── bmi2.c
-    ├── bmi2.h
-    ├── bmi2_defs.h
-    ├── bmi270.c
-    └── bmi270.h
-```
+3D-модель — схематичный QAV250. Этот комплект показывает ориентацию и измерения; он не управляет моторами и не оценивает координаты, высоту или обороты. Проверка сборки не заменяет проверку на конкретной плате.

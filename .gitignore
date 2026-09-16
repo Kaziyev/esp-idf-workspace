@@ -1,8 +1,17 @@
-*
-!.gitignore
-!README.md
-!apps/
-apps/*
-!apps/i2c_imu/
-!apps/i2c_imu/**
-apps/i2c_imu/build/
+# ESP-IDF generated output and local editor state
+**/build*/
+**/managed_components/
+**/sdkconfig.old
+**/sdkconfig.*.local
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+.env.*
+# Local toolchains never belong in this repository.
+.espressif/
+esp-idf/
