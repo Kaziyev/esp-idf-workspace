@@ -10,6 +10,22 @@ menu "QAV250"
         range 0 48
         default 39
 
+    choice QAV250_MAG_AXES
+        prompt "BMM150 axes relative to BMI270"
+        default QAV250_MAG_AXES_PHOTO
+
+        config QAV250_MAG_AXES_PHOTO
+            bool "Photo breadboard: BMM150 (-X,+Y,-Z) -> BMI270"
+            help
+                Nominal mounting inferred from the 2026-09-20 photo:
+                black BMI270 X points left, purple BMM150 X points right,
+                both Y axes point down the photo. Z signs also differ.
+                Applies before MEKF initialization and every magnetic update.
+
+        config QAV250_MAG_AXES_ALIGNED
+            bool "Identity: BMM150 axes already match BMI270"
+    endchoice
+
     choice QAV250_TELEMETRY_FORMAT
         prompt "Serial telemetry format"
         default QAV250_OUTPUT_RAW_JSON

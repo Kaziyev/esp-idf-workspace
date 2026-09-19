@@ -23,6 +23,7 @@
 #include "bmi270.h"
 #include "bmi2.h"
 #include "bmm150.h"
+#include "sensor_axes.h"
 
 /* ============================================================
    ESP32-S3 + BMI270 + BMM150
@@ -1122,15 +1123,10 @@ static void calibrate_mag(
 /* ============================================================
    BMM150 -> BMI270 AXIS ALIGNMENT
 
-   DEFAULT = identity:
-      BMM X == BMI X
-      BMM Y == BMI Y
-      BMM Z == BMI Z
-
-   Physically align the two breakout boards the same way first.
-
-   If later you discover the BMM150 axes are rotated relative to
-   BMI270, change ONLY this function.
+   Default: user's breadboard photo, BMM -> BMI = (-X, +Y, -Z).
+   This runs before MEKF initialization, updates, and both JSON outputs.
+   Choose identity in menuconfig only when the sensor axes already agree.
+   ACC/GYRO stay in native BMI270 axes; body mounting is handled by the UI.
    ============================================================ */
 
 static void remap_mag_axes(
@@ -1138,13 +1134,13 @@ static void remap_mag_axes(
     float *my,
     float *mz)
 {
-    float x = *mx;
-    float y = *my;
-    float z = *mz;
-
-    *mx = x;
-    *my = y;
-    *mz = z;
+#ifdef CONFIG_QAV250_MAG_AXES_PHOTO
+    qav250_mag_photo_to_imu(mx, my, mz);
+#else
+    (void)mx;
+    (void)my;
+    (void)mz;
+#endif
 }
 
 
@@ -1188,6 +1184,11 @@ static int read_bmm150(
 void app_main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
+#ifdef CONFIG_QAV250_MAG_AXES_PHOTO
+    printf("MAG axes: photo mounting (-X,+Y,-Z) -> BMI270\n");
+#else
+    printf("MAG axes: identity (physically aligned with BMI270)\n");
+#endif
 #ifdef CONFIG_QAV250_OUTPUT_EKF_JSON
     printf("Telemetry: firmware MEKF JSON (q + sensors)\n");
 #else
@@ -1953,6 +1954,7 @@ void app_main(void)
                 printf(
                     "{\"v\":1,\"t_us\":%" PRId64 ",\"seq\":%" PRIu32
                     ",\"q\":[%.7f,%.7f,%.7f,%.7f]"
+                    ",\"mag_frame\":\"bmi270\""
                     ",\"a_g\":[%.5f,%.5f,%.5f]"
                     ",\"g_dps\":[%.4f,%.4f,%.4f]"
                     ",\"m_uT\":[%.4f,%.4f,%.4f]"
@@ -1977,6 +1979,7 @@ void app_main(void)
                 printf(
                     "{\"v\":1,\"t_us\":%" PRId64 ",\"seq\":%" PRIu32
                     ",\"ax\":%.5f,\"ay\":%.5f,\"az\":%.5f"
+                    ",\"mag_frame\":\"bmi270\""
                     ",\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f"
                     ",\"mx\":%.4f,\"my\":%.4f,\"mz\":%.4f"
                     ",\"mag_age_ms\":%.3f,\"acc_used\":%s,\"mag_used\":%s}\n",

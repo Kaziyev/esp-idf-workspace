@@ -3,6 +3,10 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+const htmlIds = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
+assert.equal(new Set(htmlIds).size, htmlIds.length, 'HTML IDs must be unique');
+for (const [, id] of source.matchAll(/\$\('([^']+)'\)/g)) assert(htmlIds.includes(id), `Missing UI element: ${id}`);
 const elements = new Map();
 let clock = 1000;
 function element(id) {
@@ -21,7 +25,11 @@ function element(id) {
   return elements.get(id);
 }
 let exportedBlob;
-const storage = new Map();
+// The original generic-frame tests explicitly use native IMU axes and aligned MAG.
+const storage = new Map([
+  ['qav250.imu-mount.v1', JSON.stringify({ version: 1, source: 'native', sensorToBody: [1, 0, 0, 0] })],
+  ['qav250.legacy-mag-axes.v1', 'aligned'],
+]);
 const sandbox = {
   document: { getElementById: element, createElement: () => ({ click() {} }) },
   window: { matchMedia: () => ({ matches: false }), devicePixelRatio: 1 },
@@ -32,7 +40,7 @@ const sandbox = {
   URL: { createObjectURL: b => { exportedBlob = b; return 'blob:test'; }, revokeObjectURL() {} },
 };
 vm.createContext(sandbox);
-vm.runInContext(source + '\nthis.api={normalizePacket,TelemetryParser,BrowserAHRS,state,setMode,receive,updateUI,drawScene,drawCharts,acceptSerialBytes,rawUnits,togglePause,resetBrowserView,setCharts,IMUFrame,imuFrame,quatEuler,qmul,qconj,rotation,mv,mtv,determinant,captureStablePose,zeroHeading};', sandbox);
+vm.runInContext(source + '\nthis.api={normalizePacket,TelemetryParser,BrowserAHRS,state,setMode,receive,updateUI,drawScene,drawCharts,acceptSerialBytes,rawUnits,togglePause,resetBrowserView,setCharts,IMUFrame,imuFrame,quatEuler,qmul,qconj,rotation,mv,mtv,determinant,captureStablePose,zeroHeading,magAxes,photoMountQ,demoPacket};', sandbox);
 const a = sandbox.api, plain = v => JSON.parse(JSON.stringify(v));
 const sample = { ax: .1911, ay: -.1360, az: .9778, gx: .183, gy: -.183, gz: -.183, mx: -11, my: 39, mz: 32 };
 const close = (actual, expected, tolerance = 1e-6) => assert(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
@@ -130,7 +138,7 @@ const closeVector = (actual, target, tolerance = 1e-6) => target.forEach((v, i) 
 function sensorPacket(mount, rpy, heading = 0, firmware = true) {
   const boardQ = a.quatEuler(rpy), boardR = a.rotation(boardQ), mountR = a.rotation(mount);
   const sensorVector = v => a.mtv(mountR, v);
-  const packet = { a_g: sensorVector(a.mtv(boardR, [0, 0, 1])),
+  const packet = { mag_frame: 'bmi270', a_g: sensorVector(a.mtv(boardR, [0, 0, 1])),
     g_dps: sensorVector([0, 0, 0]), m_uT: sensorVector(a.mtv(boardR, [25, 0, -40])),
     bias_dps: sensorVector([.1, -.2, .3]) };
   if (firmware) packet.q = a.qmul(a.quatEuler([0, 0, heading]), a.qmul(boardQ, mount));
@@ -182,7 +190,7 @@ function reloadFrame() {
 }
 const profile = storage.get('qav250.imu-mount.v1');
 closeVector(reloadFrame().sensorToBody, a.imuFrame.sensorToBody);
-storage.set('qav250.imu-mount.v1', '{broken'); assert(!reloadFrame().calibrated);
+storage.set('qav250.imu-mount.v1', '{broken'); assert.equal(reloadFrame().mountSource, 'photo_usb');
 storage.set('qav250.imu-mount.v1', profile);
 closeVector(a.state.display.rpy, [0, 30, 0]); closeVector(a.state.history[0].rpy, [0, 0, 0]);
 assert(a.state.history.every(p => p.coordinateFrame === 'body_calibrated'));
@@ -227,13 +235,65 @@ a.setMode('serial'); a.state.port = {};
 a.receive(a.normalizePacket({ g_dps: a.mtv(a.rotation(tiltedMount), [1, 2, 3]) }));
 assert.equal(a.state.display.q, null); closeVector(a.state.display.g, [1, 2, 3]);
 assert.deepEqual(plain(a.state.display.a), [null, null, null]);
-element('calibrate-reset').onclick(); assert(!a.imuFrame.calibrated); assert(!storage.has('qav250.imu-mount.v1'));
+element('calibrate-reset').onclick(); assert(!a.imuFrame.calibrated); assert.equal(JSON.parse(storage.get('qav250.imu-mount.v1')).source, 'native');
+assert(!reloadFrame().calibrated);
 closeVector(a.state.display.g, a.mtv(a.rotation(tiltedMount), [1, 2, 3]));
+
+// Photo profile: forward = toward USB (-IMU Y), left = IMU X, up = IMU Z.
+storage.delete('qav250.imu-mount.v1');
+const photoFrame = reloadFrame(); assert.equal(photoFrame.mountSource, 'photo_usb');
+closeVector(a.mv(a.rotation(photoFrame.sensorToBody), [0, -1, 0]), [1, 0, 0]);
+closeVector(a.mv(a.rotation(photoFrame.sensorToBody), [1, 0, 0]), [0, 1, 0]);
+closeVector(a.mv(a.rotation(photoFrame.sensorToBody), [0, 0, 1]), [0, 0, 1]);
+
+// Distinct magnetometer frame must be handled BEFORE either browser tilt/heading fusion.
+a.magAxes.legacy = 'photo';
+const magnetic = { a_g: [0, 0, 1], m_uT: [13, -27, 42] };
+let magneticPacket = a.normalizePacket(magnetic);
+closeVector(magneticPacket.m, [-13, -27, -42]);
+assert.equal(magneticPacket.magMapping, 'photo_y180');
+closeVector(magnetic.m_uT, [13, -27, 42]); // untouched source for replays/diagnostics
+closeVector(a.normalizePacket({ ...magnetic, mag_frame: 'bmi270' }).m, [13, -27, 42]); // not twice
+a.magAxes.legacy = 'aligned';
+closeVector(a.normalizePacket({ ...magnetic, mag_frame: 'bmm150' }).m, [-13, -27, -42]);
+closeVector(a.normalizePacket(magnetic).m, [13, -27, 42]);
+assert.equal(a.normalizePacket({ m_uT: [13, -27, 42], mag_frame: 'unknown' }), null);
+assert.deepEqual(plain(a.normalizePacket({ ...magnetic, mag_frame: 'unknown' }).m), [null, null, null]);
+a.magAxes.legacy = 'photo';
+assert(a.normalizePacket({ ...magnetic, q: [1, 0, 0, 0] }).warnings.some(s => s.includes('MEKF')));
+assert.equal(a.normalizePacket({ ...magnetic, q: [1, 0, 0, 0], mag_frame: 'bmi270' }).warnings.length, 0);
+
+// End-to-end: same physical board motion through old raw BMM axes and updated firmware q.
+element('calibrate-photo').onclick();
+assert.equal(a.imuFrame.mountSource, 'photo_usb');
+assert.equal(JSON.parse(storage.get('qav250.imu-mount.v1')).source, 'photo_usb');
+for (const firmware of [false, true]) {
+  a.setMode('serial'); a.state.port = {};
+  for (const rpy of [[0, 0, 0], [0, 30, 0], [0, -30, 0], [25, 0, 0], [-25, 0, 0], [0, 0, 45], [15, -20, 55]]) {
+    for (let i = 0; i < 100; i++) {
+      const input = sensorPacket(a.photoMountQ, rpy, 37, firmware);
+      if (!firmware) { // Old firmware emits native BMM axes, without a frame tag.
+        delete input.mag_frame; delete input.bias_dps;
+        input.m_uT = [-input.m_uT[0], input.m_uT[1], -input.m_uT[2]];
+      }
+      clock += 100; a.receive(a.normalizePacket(input), { hostNow: clock });
+    }
+    closeVector(a.state.display.rpy, rpy, .01);
+    closeVector(a.mv(a.rotation(a.state.display.q), a.state.display.a), [0, 0, 1], .001);
+    closeVector(a.mv(a.rotation(a.state.display.q), a.state.display.m), [25, 0, -40], .01);
+    assert.equal(a.state.display.magMapping, firmware ? 'identity' : 'photo_y180');
+    assert.equal(a.state.display.coordinateFrame, 'body_photo');
+  }
+}
+a.updateUI(clock); assert.equal(element('frame-status').textContent, 'По фото · вперёд к USB');
+assert.match(element('mag-alignment-note').textContent, /повторное преобразование отключено/);
+const demoPhoto = a.demoPacket(0); closeVector(demoPhoto.m, a.mtv(a.rotation(a.quatEuler([0, 10 * Math.sin(.4), 0])), [24, 0, -39]));
+assert.equal(demoPhoto.magMapping, 'identity');
 
 calibratedExport.text().then(csv => {
   const rows = csv.trim().split('\n').map(row => row.split(',')), header = rows.shift(), last = rows.at(-1);
   assert.equal(last.length, header.length); assert.equal(last[header.indexOf('coordinate_frame')], 'body_calibrated');
   close(Number(last[header.indexOf('pitch_deg')]), 30); close(Number(last[header.indexOf('ax_g')]), -.5);
   assert(header.includes('mount_qw')); assert(header.includes('heading_zero_deg'));
-  console.log(`PASS: ${expected} telemetry frames; raw/firmware AHRS, coordinate calibration (7 mounts, all axes), 10-degree offset, two-step UI, heading, history, matrix/model/graphs/CSV, missing data and reset.`);
+  console.log(`PASS: ${expected} telemetry frames; 7 mounts and 10-degree skew, photo USB-forward profile, BMM->BMI alignment before AHRS, tagged firmware/no double rotation, raw/MEKF trajectories, UI/storage/reset, matrix/model/graphs/CSV.`);
 }).catch(error => { console.error(error); process.exitCode = 1; });
