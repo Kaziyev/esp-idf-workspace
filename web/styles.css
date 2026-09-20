@@ -10,3 +10,5 @@
 .coordinate-panel{margin-bottom:18px}.coordinate-panel .panel-head{flex-wrap:wrap;gap:10px}.coordinate-body{padding:0 20px 18px}.coordinate-body p{font-size:14px;line-height:1.6;margin:0 0 14px}.coordinate-body .toolbar{flex-wrap:wrap;margin-bottom:12px}.coordinate-body small{display:block;line-height:1.6}.coordinate-panel .chip{white-space:normal}
 .photo-setup{padding-bottom:6px}#legacy-mag-axes{width:280px;max-width:100%}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.barometer-charts{grid-template-columns:repeat(2,minmax(0,1fr))}.barometer-note{font-size:13px;margin:0 0 14px}.barometer-section .section-top{flex-wrap:wrap;gap:10px}.barometer-section .chip{white-space:normal}.barometer-section .chart-foot>span{font-size:15px;font-variant-numeric:tabular-nums}
+@media(max-width:780px){.barometer-charts{grid-template-columns:1fr}}

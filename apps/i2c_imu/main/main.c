@@ -1,4 +1,4 @@
-/* QAV250 telemetry kit: ESP32-S3 + BMI270 + BMM150.
+/* QAV250 telemetry kit: ESP32-S3 + BMI270 + BMM150 + optional BMP388/BMP390.
  * Derived from the user's supplied MEKF implementation.
  * Default: raw ax..mz JSON with read timestamps, for browser AHRS.
  * Optional: firmware MEKF quaternion JSON (idf.py menuconfig > QAV250).
@@ -24,6 +24,7 @@
 #include "bmi2.h"
 #include "bmm150.h"
 #include "sensor_axes.h"
+#include "barometer.h"
 
 /* ============================================================
    ESP32-S3 + BMI270 + BMM150
@@ -102,6 +103,64 @@
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static i2c_master_dev_handle_t bmi_dev = NULL;
 static i2c_master_dev_handle_t bmm_dev = NULL;
+static i2c_master_dev_handle_t bmp_dev = NULL;
+
+/* BMP3 transactions have a short timeout so a missing/disconnected barometer
+ * cannot stall IMU acquisition for the default one-second I2C timeout. */
+static BMP3_INTF_RET_TYPE bmp_i2c_read(uint8_t reg, uint8_t *data, uint32_t len, void *ptr)
+{
+    return i2c_master_transmit_receive((i2c_master_dev_handle_t)ptr,
+        &reg, 1, data, len, 10) == ESP_OK ? 0 : -1;
+}
+
+static BMP3_INTF_RET_TYPE bmp_i2c_write(uint8_t reg, const uint8_t *data, uint32_t len, void *ptr)
+{
+    uint8_t buffer[64];
+    if (len > sizeof(buffer) - 1) return -1;
+    buffer[0] = reg;
+    memcpy(buffer + 1, data, len);
+    return i2c_master_transmit((i2c_master_dev_handle_t)ptr, buffer, len + 1, 10) == ESP_OK ? 0 : -1;
+}
+
+static void bmp_delay_us(uint32_t period, void *ptr)
+{
+    (void)ptr;
+    esp_rom_delay_us(period);
+}
+
+static void start_barometer(struct barometer *sensor)
+{
+    /* Verify chip ID before resetting/configuring anything: another I2C
+     * peripheral may acknowledge these addresses. Try both if the first fails. */
+    const uint8_t addresses[] = {BMP3_ADDR_I2C_PRIM, BMP3_ADDR_I2C_SEC};
+    for (size_t i = 0; i < sizeof(addresses); i++) {
+        if (i2c_master_probe(i2c_bus, addresses[i], 10) != ESP_OK) continue;
+        const i2c_device_config_t config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addresses[i],
+            .scl_speed_hz = I2C_SPEED_HZ,
+        };
+        if (i2c_master_bus_add_device(i2c_bus, &config, &bmp_dev) != ESP_OK) continue;
+        uint8_t chip = 0;
+        if (bmp_i2c_read(BMP3_REG_CHIP_ID, &chip, 1, bmp_dev) == 0 &&
+            (chip == BMP3_CHIP_ID || chip == BMP390_CHIP_ID)) {
+            *sensor = (struct barometer){.address = addresses[i], .sample_time_us = -1,
+                .dev = {.intf = BMP3_I2C_INTF, .intf_ptr = bmp_dev,
+                    .read = bmp_i2c_read, .write = bmp_i2c_write, .delay_us = bmp_delay_us}};
+            const int8_t result = barometer_init(sensor);
+            if (result == BMP3_OK) {
+                printf("BMP%u initialized at 0x%02X: 25 Hz, pressure 8x, temperature 2x, IIR 3\n",
+                    chip == BMP390_CHIP_ID ? 390U : 388U, addresses[i]);
+                return;
+            }
+            printf("WARNING: BMP3xx init at 0x%02X failed (%d)\n", addresses[i], result);
+        }
+        i2c_master_bus_rm_device(bmp_dev);
+        bmp_dev = NULL;
+    }
+    *sensor = (struct barometer){.sample_time_us = -1};
+    printf("WARNING: BMP388/BMP390 unavailable at 0x76/0x77; IMU continues without barometer\n");
+}
 
 
 /* ============================================================
@@ -1567,6 +1626,9 @@ void app_main(void)
 
     printf("BMM150 initialized\n");
 
+    struct barometer baro = {.sample_time_us = -1};
+    start_barometer(&baro);
+
     vTaskDelay(pdMS_TO_TICKS(200));
 
 
@@ -1931,11 +1993,16 @@ void app_main(void)
 
         if ((loop_counter % PRINT_DIVIDER) == 0U)
         {
+            /* Sensor converts in normal mode at 25 Hz; read latest ready pair
+             * at telemetry rate (~10 Hz). No busy-wait and no AHRS coupling. */
+            if (baro.initialized) barometer_poll(&baro, esp_timer_get_time());
             /* Exact nominal quaternion; no reconstruction from rounded Euler angles.
              * mag_age_ms is age since the last successful API read, not hardware DRDY.
              * This telemetry change does not fix timing or sample-freshness handling.
              */
             const int64_t emit_time_us = esp_timer_get_time();
+            char baro_json[240];
+            barometer_json(&baro, emit_time_us, baro_json, sizeof(baro_json));
             const float mag_read_age_ms =
                 (float)(emit_time_us - last_mag_read_us) / 1000.0f;
             const float values[] = {
@@ -1960,7 +2027,7 @@ void app_main(void)
                     ",\"m_uT\":[%.4f,%.4f,%.4f]"
                     ",\"bias_dps\":[%.5f,%.5f,%.5f]"
                     ",\"dt_s\":%.6f,\"acc_used\":%s,\"mag_used\":%s"
-                    ",\"mag_age_ms\":%.3f}\n",
+                    ",\"mag_age_ms\":%.3f%s}\n",
                     sample_time_us, telemetry_seq++,
                     ekf.q[0], ekf.q[1], ekf.q[2], ekf.q[3],
                     ax, ay, az,
@@ -1969,7 +2036,7 @@ void app_main(void)
                     ekf.bias[0] * RAD_TO_DEG, ekf.bias[1] * RAD_TO_DEG,
                     ekf.bias[2] * RAD_TO_DEG,
                     dt, last_acc_used ? "true" : "false",
-                    last_mag_used ? "true" : "false", mag_read_age_ms
+                    last_mag_used ? "true" : "false", mag_read_age_ms, baro_json
                 );
 #else
                 /* Same flat sensor keys as the user's working firmware.
@@ -1982,13 +2049,13 @@ void app_main(void)
                     ",\"mag_frame\":\"bmi270\""
                     ",\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f"
                     ",\"mx\":%.4f,\"my\":%.4f,\"mz\":%.4f"
-                    ",\"mag_age_ms\":%.3f,\"acc_used\":%s,\"mag_used\":%s}\n",
+                    ",\"mag_age_ms\":%.3f,\"acc_used\":%s,\"mag_used\":%s%s}\n",
                     sample_time_us, telemetry_seq++,
                     ax, ay, az,
                     gx * RAD_TO_DEG, gy * RAD_TO_DEG, gz * RAD_TO_DEG,
                     last_mx, last_my, last_mz, mag_read_age_ms,
                     last_acc_used ? "true" : "false",
-                    last_mag_used ? "true" : "false"
+                    last_mag_used ? "true" : "false", baro_json
                 );
 #endif
             } else {

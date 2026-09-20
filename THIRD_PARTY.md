@@ -16,4 +16,14 @@ Upstream: [Bosch BMM150 Sensor API](https://github.com/boschsensortec/BMM150_Sen
 
 License: [BSD-3-Clause](licenses/BMM150-BSD-3-Clause.txt), with original notices preserved in the source files.
 
+## BMP3xx
+
+`apps/i2c_imu/main/bmp3.c`, `bmp3.h`, and `bmp3_defs.h` are copied from the official Bosch BMP3 Sensor API **v2.0.6** (2022-04-01), at commit:
+
+`db4cf8e4140c593b8c3d85f8c6c07335c7ffa9dc`
+
+Upstream: [Bosch BMP3 Sensor API](https://github.com/boschsensortec/BMP3_SensorAPI/tree/db4cf8e4140c593b8c3d85f8c6c07335c7ffa9dc).
+
+License: [BSD-3-Clause](licenses/BMP3-BSD-3-Clause.txt). Original notices and source content are preserved (line endings may be normalized by Git). The project adapter `barometer.c` uses floating-point compensation in Pa / °C and configures one register per write, without changing the vendor driver.
+
 The dashboard uses browser APIs and original JavaScript; it does not load a third-party graphics or chart library. The browser AHRS is an independent simplified complementary filter, not a bundled copy of the x-io Fusion library.

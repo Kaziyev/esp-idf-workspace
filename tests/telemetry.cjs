@@ -98,7 +98,7 @@ close(a.normalizePacket({ a_g: [0, 0, 1], g_dps: [10, 0, 0] }).g[0], 10);
 a.rawUnits.acc = 'g'; a.rawUnits.gyro = 'dps'; a.rawUnits.mag = 'uT';
 
 // Replay the actual attached diagnostic when supplied, including its header and last line without LF.
-const text = process.argv[2] ? fs.readFileSync(process.argv[2], 'utf8') : Array.from({ length: 120 }, () => JSON.stringify(sample)).join('\r\n');
+const text = process.argv[2] && process.argv[2] !== '--barometer-exe' ? fs.readFileSync(process.argv[2], 'utf8') : Array.from({ length: 120 }, () => JSON.stringify(sample)).join('\r\n');
 const expected = text.split(/\r?\n/).filter(s => s.startsWith('{')).length;
 const packets = [], errors = [];
 const parser = new a.TelemetryParser(p => packets.push(p), e => errors.push(e));
@@ -290,10 +290,92 @@ assert.match(element('mag-alignment-note').textContent, /повторное пр
 const demoPhoto = a.demoPacket(0); closeVector(demoPhoto.m, a.mtv(a.rotation(a.quatEuler([0, 10 * Math.sin(.4), 0])), [24, 0, -39]));
 assert.equal(demoPhoto.magMapping, 'identity');
 
+// BMP3xx scalar fields must survive raw/MEKF, mounting, pause, CSV and log paths.
+const baroFields = { pressure_pa: 100025, temperature_c: 25, baro_valid: true, baro_age_ms: 1, baro_model: 'BMP390', baro_address: 119 };
+for (const firmware of [false, true]) {
+  a.setMode('serial'); a.state.port = {};
+  for (let i = 0; i < 20; i++) {
+    clock += 100;
+    a.receive(a.normalizePacket({ ...level, ...(firmware ? { q: [1, 0, 0, 0] } : {}), ...baroFields, pressure_pa: 100025 + i, t_us: i * 100000, seq: i }), { hostNow: clock });
+  }
+  a.updateUI(clock); a.drawCharts();
+  assert.equal(element('chart-value-3').textContent, '1000.44 hPa');
+  assert.equal(element('chart-value-4').textContent, '25.00 °C');
+  assert.match(element('baro-status').textContent, /BMP390 · ДАННЫЕ/);
+  assert.match(element('baro-note').textContent, /0x77/);
+  for (const mode of ['sensors', 'attitude']) {
+    a.setCharts(mode);
+    for (const id of ['chart-3', 'chart-4']) element(id).context.calls.length = 0;
+    a.drawCharts();
+    for (const id of ['chart-3', 'chart-4']) assert(element(id).context.calls.filter(c => c[0] === 'lineTo').length > 15);
+  }
+  // Mount and heading changes cannot rotate or otherwise alter scalar data.
+  element('calibrate-photo').onclick(); a.updateUI(clock);
+  assert.equal(a.state.display.pressurePa, 100044); assert.equal(a.state.display.temperatureC, 25);
+  a.togglePause(); const pressureFrozen = a.state.display.pressurePa;
+  clock += 100; a.receive(a.normalizePacket({ ...level, ...baroFields, pressure_pa: 99000 }), { hostNow: clock });
+  a.updateUI(clock + 10000); assert.equal(a.state.display.pressurePa, pressureFrozen);
+  assert.equal(element('chart-value-3').textContent, '1000.44 hPa');
+  a.togglePause(); a.updateUI(clock); assert.equal(element('chart-value-3').textContent, '990.00 hPa');
+  a.updateUI(clock + 501); assert.equal(element('chart-value-3').textContent, '—');
+  assert.match(element('baro-status').textContent, /НЕТ СВЕЖИХ ДАННЫХ/);
+  a.state.port = null; a.updateUI(clock); assert.equal(element('chart-value-4').textContent, '—');
+}
+for (const invalid of [null, '', true, false, 'NaN', Infinity, -1, 0, 29999, 125001]) {
+  const p = a.normalizePacket({ ...level, ...baroFields, pressure_pa: invalid });
+  assert.equal(p.pressurePa, null); assert.equal(p.temperatureC, 25);
+}
+for (const invalid of [null, '', true, 'NaN', Infinity, -41, 86]) {
+  assert.equal(a.normalizePacket({ ...level, ...baroFields, temperature_c: invalid }).temperatureC, null);
+}
+for (const metadata of [{ baro_valid: false }, { baro_valid: 'bad' }, { baro_age_ms: 501 }, { baro_age_ms: -1 }, { baro_age_ms: 'bad' }]) {
+  const p = a.normalizePacket({ ...level, ...baroFields, ...metadata });
+  assert.equal(p.pressurePa, null); assert.equal(p.temperatureC, null);
+}
+assert.equal(a.normalizePacket({ ...level, pressure_pa: '100025', temperature_c: '0' }).temperatureC, 0);
+assert.equal(a.normalizePacket({ ...level, ...baroFields, baro_age_ms: 500 }).pressurePa, 100025);
+assert.equal(a.normalizePacket(baroFields).q, null); // pressure alone invents no orientation
+assert.equal(a.normalizePacket(level).pressurePa, null);
+assert.equal(a.normalizePacket(level).baroReported, false);
+const baroParsed = [], baroErrors = [], baroParser = new a.TelemetryParser(p => baroParsed.push(p), e => baroErrors.push(e));
+baroParser.feed(JSON.stringify({ ...level, ...baroFields }) + '\r\n');
+baroParser.flush(); assert.equal(baroErrors.length, 0); assert.equal(baroParsed[0].pressurePa, 100025);
+a.setMode('log'); a.receive(baroParsed[0], { hostNow: 0, logTime: 0 }); a.updateUI(clock + 100000);
+assert.equal(element('chart-value-3').textContent, '1000.25 hPa'); // log is not live
+assert.match(element('baro-status').textContent, /ЖУРНАЛ/);
+element('export').onclick(); const baroExport = exportedBlob;
+baroExport.text().then(csv => {
+  const [header, row] = csv.trim().split('\n').map(line => line.split(','));
+  assert.equal(header.length, row.length);
+  assert.equal(row[header.indexOf('pressure_pa')], '100025');
+  assert.equal(row[header.indexOf('temperature_c')], '25');
+  assert.equal(row[header.indexOf('baro_valid')], '1');
+  assert.equal(row[header.indexOf('baro_model')], 'BMP390');
+}).catch(error => { console.error(error); process.exitCode = 1; });
+// Optional real host-C adapter output: node tests/telemetry.cjs --barometer-exe <path>.
+const baroExeIndex = process.argv.indexOf('--barometer-exe');
+if (baroExeIndex >= 0) {
+  const output = require('node:child_process').execFileSync(process.argv[baroExeIndex + 1], { encoding: 'utf8' });
+  const payloads = output.split(/\r?\n/).filter(line => line.startsWith('{')).map(JSON.parse);
+  assert.equal(payloads.length, 3);
+  for (const payload of payloads) {
+    const p = a.normalizePacket({ ...level, ...payload });
+    assert.equal(p.pressurePa, payload.pressure_pa);
+    assert.equal(p.temperatureC, payload.temperature_c);
+    assert.equal(p.baroValid, payload.baro_valid);
+  }
+}
+a.setMode('serial'); a.state.port = {};
+a.receive(a.normalizePacket(level), { hostNow: clock }); a.updateUI(clock); a.drawCharts();
+assert.equal(element('chart-value-3').textContent, '—');
+assert.match(element('baro-note').textContent, /прошивку/);
+assert.equal(a.demoPacket(1).baroValid, true);
+assert(Number.isFinite(a.demoPacket(1).pressurePa));
+
 calibratedExport.text().then(csv => {
   const rows = csv.trim().split('\n').map(row => row.split(',')), header = rows.shift(), last = rows.at(-1);
   assert.equal(last.length, header.length); assert.equal(last[header.indexOf('coordinate_frame')], 'body_calibrated');
   close(Number(last[header.indexOf('pitch_deg')]), 30); close(Number(last[header.indexOf('ax_g')]), -.5);
   assert(header.includes('mount_qw')); assert(header.includes('heading_zero_deg'));
-  console.log(`PASS: ${expected} telemetry frames; 7 mounts and 10-degree skew, photo USB-forward profile, BMM->BMI alignment before AHRS, tagged firmware/no double rotation, raw/MEKF trajectories, UI/storage/reset, matrix/model/graphs/CSV.`);
+  console.log(`PASS: ${expected} telemetry frames; 7 mounts and 10-degree skew, photo USB-forward profile, BMM->BMI alignment, raw/MEKF, BMP3xx Pa/hPa/C, scalar charts, stale/missing/errors, pause/log/CSV and optional C output.`);
 }).catch(error => { console.error(error); process.exitCode = 1; });
